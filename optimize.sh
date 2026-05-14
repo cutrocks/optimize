@@ -24,7 +24,7 @@ skip() { p "  [SKIP] $*"; }
 sep()  { p "$SEP"; }
 
 sep
-p "  [$TS] Omni CPU Balance Optimizer v2.5 - START"
+p "  [$TS] Omni CPU Balance Optimizer"
 p "  SKIP_NUMA = $SKIP_NUMA"
 sep
 
