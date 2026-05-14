@@ -1,7 +1,5 @@
 #!/bin/bash
-# Omni CPU Balance Optimizer v2.5 - Dell R630 / CentOS 7
-# Zero downtime - idempotent - no reboot required
-# Usage: ./optimize.sh [NIC]   <- NIC optional, auto-detected if not given
+# Omni CPU Balance Optimizer 
 # Log  : /var/log/omni-cpu-tune.log
 
 set -uo pipefail
