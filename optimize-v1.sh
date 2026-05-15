@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  SMART CPU AUTO-REBALANCER — CentOS 7 | Dell R630
-#  2x Xeon E5-2690 v3 | 48 Logical CPUs (24c x2 HT)
+#  SMART CPU AUTO-REBALANCER — CentOS 7
+#  Dual Socket | 48 Logical CPUs (24c x2 HT)
 #
 #  Strategy:
 #  1. Sample per-CPU utilization
@@ -192,6 +192,78 @@ move_process() {
     else
         log_msg WARN "Failed to move PID $pid ($comm)"
         return 1
+    fi
+}
+
+# ─────────────────────────────────────────────
+# 7B. HT IMBALANCE DETECTOR + FIX
+#     Detects: cpu0-23 (physical) overloaded
+#              cpu24-47 (HT siblings) underutilized
+#     Fix: open ALL pinned processes to full 48 CPUs
+#          (NOT pin to HT only — let kernel schedule freely)
+# ─────────────────────────────────────────────
+check_ht_imbalance() {
+    local cycle=$1
+    local phy_total=0 phy_n=0 ht_total=0 ht_n=0
+
+    for cpu in "${!CPU_USAGE[@]}"; do
+        local u="${CPU_USAGE[$cpu]}"
+        if [[ "$cpu" -ge 0 && "$cpu" -le 23 ]] 2>/dev/null; then
+            phy_total=$(awk "BEGIN{print $phy_total + $u}")
+            phy_n=$((phy_n + 1))
+        elif [[ "$cpu" -ge 24 && "$cpu" -le 47 ]] 2>/dev/null; then
+            ht_total=$(awk "BEGIN{print $ht_total + $u}")
+            ht_n=$((ht_n + 1))
+        fi
+    done
+
+    [[ $phy_n -eq 0 || $ht_n -eq 0 ]] && return
+
+    local phy_avg ht_avg ht_delta
+    phy_avg=$(awk "BEGIN{printf \"%.1f\", $phy_total/$phy_n}")
+    ht_avg=$(awk  "BEGIN{printf \"%.1f\", $ht_total/$ht_n}")
+    ht_delta=$(awk "BEGIN{d=$phy_avg-$ht_avg; if(d<0)d=-d; printf \"%.1f\",d}")
+
+    log_msg STAT "HT check | Physical(cpu0-23): ${phy_avg}% | HT(cpu24-47): ${ht_avg}% | Delta: ${ht_delta}%"
+
+    # HT imbalance threshold: physical > HT by more than 25%
+    local is_imbalanced
+    is_imbalanced=$(awk "BEGIN{print ($phy_avg - $ht_avg > 25) ? 1 : 0}")
+
+    if [[ "$is_imbalanced" == "1" ]]; then
+        log_msg WARN "HT IMBALANCE detected (cycle $cycle) — Physical ${phy_avg}% vs HT ${ht_avg}%"
+        log_msg WARN "Processes pinned to cpu0-23 only — opening all to full 48 CPUs..."
+
+        # GAP 2 FIX: Open to ALL 48 CPUs (not pin to HT subset)
+        # This lets the kernel scheduler use ALL logical CPUs freely
+        local fixed=0
+        while IFS= read -r line; do
+            local pid ppid comm aff_hex aff_dec
+            pid=$(echo "$line"  | awk '{print $1}')
+            ppid=$(echo "$line" | awk '{print $2}')
+            comm=$(echo "$line" | awk '{print $3}')
+
+            [[ "$ppid" -le 2 ]] && continue
+            echo "$comm" | grep -qE "$BLACKLIST" && continue
+            kill -0 "$pid" 2>/dev/null || continue
+
+            aff_hex=$(taskset -p "$pid" 2>/dev/null | awk -F': ' '{print $2}')
+            [[ -z "$aff_hex" ]] && continue
+
+            # Check if process is pinned to cpu0-23 only (mask <= 0xFFFFFF)
+            aff_dec=$(printf "%d" "0x${aff_hex}" 2>/dev/null || echo 0)
+            local half_mask=16777215  # 0x000000ffffff = cpu0-23 only
+
+            if [[ "$aff_dec" -le "$half_mask" && "$aff_dec" -gt 0 ]]; then
+                # Open to ALL 48 CPUs — do NOT pin to specific HT siblings
+                if taskset -p 0xffffffffffff "$pid" &>/dev/null; then
+                    log_msg MOVE "HT-fix: $comm (PID:$pid) mask 0x${aff_hex} → 0xffffffffffff (all 48 CPUs)"
+                    fixed=$((fixed + 1))
+                fi
+            fi
+        done < <(ps -eo pid,ppid,comm --no-headers 2>/dev/null)
+
+        log_msg INFO "HT fix: opened $fixed pinned processes to all 48 CPUs"
     fi
 }
 
@@ -470,6 +542,32 @@ show_status() {
     ps -eo pid,pcpu,psr,comm --no-headers --sort=-pcpu 2>/dev/null | \
         awk '$2 >= 5 {printf "    PID:%-7s %6.1f%%  cpu%-3s  %s\n", $1, $2, $3, $4}' | \
         head -20
+
+    # ── HT Imbalance indicator ──
+    local phy_t=0 phy_n=0 ht_t=0 ht_n=0
+    for cpu in "${!CPU_USAGE[@]}"; do
+        local u="${CPU_USAGE[$cpu]}"
+        if [[ "$cpu" -ge 0 && "$cpu" -le 23 ]] 2>/dev/null; then
+            phy_t=$(awk "BEGIN{print $phy_t+$u}"); phy_n=$((phy_n+1))
+        elif [[ "$cpu" -ge 24 && "$cpu" -le 47 ]] 2>/dev/null; then
+            ht_t=$(awk "BEGIN{print $ht_t+$u}"); ht_n=$((ht_n+1))
+        fi
+    done
+    if [[ $phy_n -gt 0 && $ht_n -gt 0 ]]; then
+        local phy_a ht_a ht_d
+        phy_a=$(awk "BEGIN{printf \"%.1f\", $phy_t/$phy_n}")
+        ht_a=$(awk  "BEGIN{printf \"%.1f\", $ht_t/$ht_n}")
+        ht_d=$(awk  "BEGIN{d=$phy_a-$ht_a; if(d<0)d=-d; printf \"%.1f\",d}")
+        echo ""
+        echo -e "  ${BOLD}HT Balance (Physical vs HT Siblings):${NC}"
+        printf  "    Physical  cpu0-23  avg: ${RED}%s%%${NC}\n"  "$phy_a"
+        printf  "    HT Sibling cpu24-47 avg: ${BLUE}%s%%${NC}\n" "$ht_a"
+        local ht_status
+        ht_status=$(awk "BEGIN{print ($phy_a - $ht_a > 25) ? \"IMBALANCED\" : \"OK\"}")
+        [[ "$ht_status" == "IMBALANCED" ]] && \
+            printf "    Status: ${RED}${BOLD}✘ HT IMBALANCED — delta %s%%${NC}\n" "$ht_d" || \
+            printf "    Status: ${GREEN}${BOLD}✔ HT OK — delta %s%%${NC}\n" "$ht_d"
+    fi
     echo ""
 }
 
@@ -483,7 +581,7 @@ install_service() {
 
     cat > "$service_file" << EOF
 [Unit]
-Description=CPU Auto-Rebalancer — Dell R630 CentOS 7
+Description=CPU Auto-Rebalancer — CentOS 7
 After=network.target irqbalance.service
 Wants=irqbalance.service
 
@@ -558,6 +656,11 @@ main() {
         while true; do
             CYCLE=$((CYCLE + 1))
             rotate_log
+            # GAP 1 FIX: Re-open affinity every 5 cycles
+            # catches newly spawned/re-pinned BattleServer workers
+            [[ $((CYCLE % 5)) -eq 0 ]] && open_affinity_all
+            sample_cpu_usage
+            check_ht_imbalance "$CYCLE"
             do_rebalance "$CYCLE"
             sleep "$INTERVAL"
         done
@@ -571,7 +674,7 @@ main() {
         echo -e "${BOLD}${CYAN}"
         echo "  ╔══════════════════════════════════════════════════╗"
         echo "  ║   CPU AUTO-REBALANCER — Single Run Mode          ║"
-        echo "  ║   2x E5-2690 v3 | CentOS 7          ║"
+        echo "  ║   CentOS 7 | Dual Socket CPU          ║"
         echo "  ╚══════════════════════════════════════════════════╝"
         echo -e "${NC}"
 
@@ -580,6 +683,8 @@ main() {
         apply_kernel_tuning
         open_affinity_all
 
+        sample_cpu_usage
+        check_ht_imbalance 1
         log_msg INFO "Running rebalance cycle..."
         do_rebalance 1
 
