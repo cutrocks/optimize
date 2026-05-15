@@ -11,10 +11,10 @@
 #  5. Loop every INTERVAL seconds as a daemon
 #
 #  Usage:
-#    ./cpu_autobalance.sh            # run once (manual)
-#    ./cpu_autobalance.sh --daemon   # run as daemon loop
-#    ./cpu_autobalance.sh --install  # install as systemd service
-#    ./cpu_autobalance.sh --status   # show current CPU balance
+#    ./optimize-v1.sh           # run once (manual)
+#    ./optimize-v1.sh --daemon   # run as daemon loop
+#    ./optimize-v1.sh --install  # install as systemd service
+#    ./optimize-v1.sh --status   # show current CPU balance
 # ============================================================
 
 # ── Tunable Parameters ─────────────────────────────────────
